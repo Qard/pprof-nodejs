@@ -16,6 +16,7 @@
 
 #include <nan.h>
 #include <node.h>
+#include <v8-internal.h>
 #include <v8-profiler.h>
 #include <cinttypes>
 #include <cstdint>
@@ -41,6 +42,13 @@ struct TimeTicks {
   static int64_t Now();
 };
 }  // namespace base
+namespace internal {
+struct HandleScopeData {
+  v8::internal::Address* next;
+  v8::internal::Address* limit;
+};
+constexpr int kHandleBlockSize = v8::internal::KB - 2;
+}  // namespace internal
 }  // namespace v8
 
 static int64_t Now() {
@@ -1206,14 +1214,31 @@ ContextPtr WallProfiler::GetContextPtrSignalSafe(Isolate* isolate) {
   return GetContextPtr(isolate);
 }
 
+// Returns the number of free Address slots for Locals that can be returned by
+// the isolate without triggering memory allocation.
+int GetFreeLocalSlotCount(Isolate* isolate) {
+  v8::internal::HandleScopeData* data =
+      reinterpret_cast<v8::internal::HandleScopeData*>(
+          reinterpret_cast<uint64_t>(isolate) +
+          v8::internal::Internals::kIsolateHandleScopeDataOffset);
+  auto diff = data->limit - data->next;
+  // sanity check: diff can be at most kHandleBlockSize. If it is larger,
+  // something is suspicious. See
+  // https://github.com/v8/v8/blob/6fcfeccda2d8bcb7397f89bf5bbacd0c2eb2fb7f/src/handles/handles.cc#L195
+  return diff > v8::internal::kHandleBlockSize ? 0 : diff;
+}
+
 ContextPtr WallProfiler::GetContextPtr(Isolate* isolate) {
 #if NODE_MAJOR_VERSION >= 23
   if (!useCPED_) {
     return curContext_;
   }
 
-  if (!isolate->IsInUse()) {
-    // Must not try to create a handle scope if isolate is not in use.
+  if (!isolate->IsInUse() || GetFreeLocalSlotCount(isolate) < 4) {
+    // Must not try to create a handle scope if isolate is not in use or if we
+    // don't have at least 4 free slots to create local handles. The 4 handles
+    // are return values of GetCPED, GetEnteredOrMicrotaskContext,
+    // cpedSymbol_.Get, and GetPrivate.
     return ContextPtr();
   }
   HandleScope scope(isolate);
@@ -1271,8 +1296,10 @@ NAN_METHOD(WallProfiler::Dispose) {
 }
 
 double GetAsyncIdNoGC(v8::Isolate* isolate) {
-  if (!isolate->IsInUse()) {
-    // Must not try to create a handle scope if isolate is not in use.
+  if (!isolate->IsInUse() || GetFreeLocalSlotCount(isolate) < 1) {
+    // Must not try to create a handle scope if isolate is not in use or if
+    // we can't create one local handle (return value of
+    // GetEnteredOrMicrotaskContext) without allocation.
     return -1;
   }
 #if NODE_MAJOR_VERSION >= 24
