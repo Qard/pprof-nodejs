@@ -1120,7 +1120,7 @@ v8::CpuProfiler* WallProfiler::CreateV8CpuProfiler() {
 }
 
 Local<Value> WallProfiler::GetContext(Isolate* isolate) {
-  auto context = GetContextPtr(isolate);
+  auto context = GetContextPtr(isolate, false);
   if (context) {
     return context->Get(isolate);
   }
@@ -1211,16 +1211,19 @@ ContextPtr WallProfiler::GetContextPtrSignalSafe(Isolate* isolate) {
     }
   }
 
-  return GetContextPtr(isolate);
+  return GetContextPtr(isolate, true);
+}
+
+v8::internal::HandleScopeData* getHandleScopeData(Isolate* isolate) {
+  return reinterpret_cast<v8::internal::HandleScopeData*>(
+      reinterpret_cast<uint64_t>(isolate) +
+      v8::internal::Internals::kIsolateHandleScopeDataOffset);
 }
 
 // Returns the number of free Address slots for Locals that can be returned by
 // the isolate without triggering memory allocation.
 int GetFreeLocalSlotCount(Isolate* isolate) {
-  v8::internal::HandleScopeData* data =
-      reinterpret_cast<v8::internal::HandleScopeData*>(
-          reinterpret_cast<uint64_t>(isolate) +
-          v8::internal::Internals::kIsolateHandleScopeDataOffset);
+  auto data = getHandleScopeData(isolate);
   auto diff = data->limit - data->next;
   // sanity check: diff can be at most kHandleBlockSize. If it is larger,
   // something is suspicious. See
@@ -1228,39 +1231,56 @@ int GetFreeLocalSlotCount(Isolate* isolate) {
   return diff > v8::internal::kHandleBlockSize ? 0 : diff;
 }
 
-ContextPtr WallProfiler::GetContextPtr(Isolate* isolate) {
+ContextPtr WallProfiler::GetContextPtr(Isolate* isolate, bool inSignalHandler) {
 #if NODE_MAJOR_VERSION >= 23
   if (!useCPED_) {
     return curContext_;
   }
 
-  if (!isolate->IsInUse() || GetFreeLocalSlotCount(isolate) < 4) {
-    // Must not try to create a handle scope if isolate is not in use or if we
-    // don't have at least 4 free slots to create local handles. The 4 handles
-    // are return values of GetCPED, GetEnteredOrMicrotaskContext,
-    // cpedSymbol_.Get, and GetPrivate.
-    return ContextPtr();
+  // HandleScope::CreateHandle() first increments HandleScopeData::next and only
+  // then writes to the Address slot in the source code, which is safe for us.
+  // The compiler is free to reorder these two operations, however, so we'll
+  // defensively save/restore the current value of the next Address slot in case
+  // the signal interrupted the thread between these two reordered operations.
+  v8::internal::Address* nextAddrPtr = nullptr;
+  v8::internal::Address savedAddr = 0;
+  if (inSignalHandler) {
+    if (!isolate->IsInUse() || GetFreeLocalSlotCount(isolate) < 4) {
+      // Must not try to create a handle scope if isolate is not in use or if we
+      // don't have at least 4 free slots to create local handles. The 4 handles
+      // are return values of GetCPED, GetEnteredOrMicrotaskContext,
+      // cpedSymbol_.Get, and GetPrivate.
+      return ContextPtr();
+    }
+    nextAddrPtr = getHandleScopeData(isolate)->next;
+    savedAddr = *nextAddrPtr;
   }
-  HandleScope scope(isolate);
+  ContextPtr retval = ContextPtr();
+  {
+    HandleScope scope(isolate);
 
-  auto cped = isolate->GetContinuationPreservedEmbedderData();
-  if (cped->IsObject()) {
-    auto v8Ctx = isolate->GetEnteredOrMicrotaskContext();
-    if (!v8Ctx.IsEmpty()) {
-      auto cpedObj = cped.As<Object>();
-      auto localSymbol = cpedSymbol_.Get(isolate);
-      auto maybeProfData = cpedObj->GetPrivate(v8Ctx, localSymbol);
-      if (!maybeProfData.IsEmpty()) {
-        auto profData = maybeProfData.ToLocalChecked();
-        if (!profData->IsUndefined()) {
-          return static_cast<PersistentContextPtr*>(
-                     profData.As<External>()->Value())
-              ->Get();
+    auto cped = isolate->GetContinuationPreservedEmbedderData();
+    if (cped->IsObject()) {
+      auto v8Ctx = isolate->GetEnteredOrMicrotaskContext();
+      if (!v8Ctx.IsEmpty()) {
+        auto cpedObj = cped.As<Object>();
+        auto localSymbol = cpedSymbol_.Get(isolate);
+        auto maybeProfData = cpedObj->GetPrivate(v8Ctx, localSymbol);
+        if (!maybeProfData.IsEmpty()) {
+          auto profData = maybeProfData.ToLocalChecked();
+          if (!profData->IsUndefined()) {
+            retval = static_cast<PersistentContextPtr*>(
+                         profData.As<External>()->Value())
+                         ->Get();
+          }
         }
       }
     }
   }
-  return ContextPtr();
+  if (nextAddrPtr) {
+    *nextAddrPtr = savedAddr;
+  }
+  return retval;
 #else
   return curContext_;
 #endif

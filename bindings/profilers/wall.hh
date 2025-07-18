@@ -114,7 +114,7 @@ class WallProfiler : public Nan::ObjectWrap {
   static void CleanupHook(void* data);
   void Cleanup(v8::Isolate* isolate);
 
-  ContextPtr GetContextPtr(v8::Isolate* isolate);
+  ContextPtr GetContextPtr(v8::Isolate* isolate, bool inSignalHandler);
   ContextPtr GetContextPtrSignalSafe(v8::Isolate* isolate);
 
   void SetCurrentContextPtr(v8::Isolate* isolate, v8::Local<v8::Value> context);
